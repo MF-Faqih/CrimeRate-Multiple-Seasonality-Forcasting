@@ -1,0 +1,334 @@
+---
+title: "LBB-TimeSeries"
+author: "MF-Faqih"
+date: "2023-04-17"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_section: true
+    collapsed: false
+    smooth_scroll: false
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+  Crime is one of the most terrifying moment a person can experience, everyone try to avoid anything that can lure crimes to their life. Today, crime rite is going higher and higher, so, doing anticipating action is a crucial things to do. One things we can do is predict when and how much crime will be happen in near future. 
+  
+  Knowing when and how much crime will happen, will help police officer to prepare and take action before the worst case happen, its also help us to avoid victims. This time Ill try to predict total crime that will happen in next 7 days in Chicago in each hour. The data set contain total every crime from first January 20223 until 10'th April 2023, and I'll focus on theft cases since it has the highest number of crime in chicago
+
+# Import Library
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(padr)
+library(forecast)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+```
+
+# Data Preparation
+
+```{r}
+crime <- read.csv("Crimes_-_2001_to_Present.csv")
+crime
+```
+
+# Data Preprocessing
+
+```{r}
+table(crime$Primary.Type)
+```
+
+  From frequency table above, Theft has the highest number of crime in Chicago, so we can predict the number of theft in next 7 days (a week)
+
+  Before we make TS object, we first should do some data preparation such as aggregation and summarise the data. This time we will aggregate the data into daily frequancy.
+
+## Data Aggregation
+
+```{r}
+theft <- crime %>% 
+  filter(Primary.Type == "THEFT") %>% 
+  select(Date) %>% 
+  mutate(Date = mdy_hms(Date),
+         Date = floor_date(Date, unit = "hour")) %>% 
+  group_by(Date) %>% 
+  summarise(total_cases = sum(n())) %>% 
+  ungroup()
+
+theft
+```
+
+  After we got total THEFT cases each day, next we make sure theres no missing time interval. Since our data has 1560 rows in total, its really difficult to check manually. So we gonna use pad() function to fill the missing interval and replace total_cases missing value with zero.
+
+## Padding Data
+
+```{r}
+theft_pad <- theft %>% 
+  arrange(Date) %>% 
+  pad(start_val = ymd_hms("2023-01-01 00:00:00"),
+      end_val = ymd_hms("2023-04-10 23:00:00")) %>% 
+  mutate(total_cases = replace_na(total_cases, 0))
+```
+
+```{r}
+colSums(is.na(theft_pad))
+```
+
+```{r}
+summary(theft_pad)
+```
+
+
+# Build TS Object
+  First ill use ts() command to make my first ts object to see and explore whether our time series object has trend and seasonal properties (on-seasonal/multiseasonal)
+  
+```{r}
+#First model
+
+theft_ts <- ts(theft_pad$total_cases, 
+               frequency = 24) #daily seasonality
+```
+
+## Plotting TS Object
+
+```{r}
+theft_ts %>% 
+  decompose() %>% 
+  autoplot()
+```
+
+  From our plot above, we know that aur trend still has seasonality patternd captured. So ill try to use another method to make TS object that can handle multiseasonality data.
+
+I'll try to use msts with some combination of frequency's number
+
+# TS Object Using MSTS
+
+```{r}
+#Second model
+
+theft_pad$total_cases %>% 
+  msts(seasonal.periods = c(24, 24*7)) %>% 
+  mstl() %>% 
+  autoplot()
+```
+
+  Our trend still captured seasonal pattern, so ill try to change our seasonal periods
+  
+```{r}
+#Third model
+
+theft_pad$total_cases %>% 
+  msts(seasonal.periods = c(24*7, 24*7*4)) %>% 
+  mstl() %>% 
+  autoplot()
+```
+
+  Third model has better decomposition among three models, therefor we will use third model to be use as time series model building
+
+```{r}
+theft_msts <- theft_pad$total_cases %>% 
+  msts(seasonal.periods = c(24*7, 24*7*4))
+```
+
+
+# Cross Validation
+  I splitting the data into train and test data for validation purpose. Test data has a week of frequency ,meanwhile the rest as train data
+
+```{r}
+data_test <- tail(theft_msts, 24*7)
+data_train <- head(theft_msts, -24*7)
+```
+
+
+# Model building
+  For model building I'll use ETS Holt-Winter and SARIMA, the reason why I choose both of it because my data contain trend and seasonal
+
+```{r}
+theft_ets <- stlm(data_train, method = "ets")
+theft_arima <- stlm(data_train, method = "arima")
+```
+
+
+# Forecast and Model Evaluation
+
+## Forecast
+  I will predict total crime cases in next seven days, and comapre it with actual data (data_test)
+
+```{r}
+theft_ets_f <- forecast(theft_ets, h = 24*7)
+theft_arima_f <- forecast(theft_arima, h = 24*7)
+```
+
+## Plotting Data
+  Plotting the forcasting result with its actual data
+
+```{r fig.width = 9, fig.height = 6}
+data_test %>% 
+  autoplot() +
+  autolayer(theft_ets_f$mean, series = "ETS") +
+  autolayer(theft_arima_f$mean, series = "ARIMA")
+```
+## Accuracy Test
+
+```{r}
+accuracy(theft_ets_f, data_test)
+accuracy(theft_arima_f, data_test)
+```
+
+  From RMSE and MAE value we can conclude ARIMA has better performance than ETS. 
+
+
+# Assumption Check
+
+## Normality Test
+1. Normality test: Shapiro test
+  H0: Residuals are normally distributed
+  H1: Residuals are not normally distributed
+
+  We try to accept H0 (P value > 0.005)
+```{r}
+shapiro.test(theft_arima_f$residuals)
+```
+
+```{r}
+hist(theft_arima_f$residuals, breaks = 10)
+```
+
+## Autocorrelation Test
+2. Autocorrelation test: Box.test - Ljng-Box
+  H0: No autocorrelation in the forecast error
+  H1: Auutocerrelation detected in the forecast residuals
+
+```{r}
+Box.test(theft_arima_f$residuals, type = "Ljung-Box")
+```
+
+  Conclusion: Our residuals forecast models are not normally distributed since its has p-value smaller than 0.005 (p-value <0.05) then we reject our null hypothesis (accept alternative hypothesis), I'll try to build our ts object using Triple Exponential's Smoothing to see if the model can solf this problem and has better performance than ARIMA. Meanwhile our Autocorrelation test show we accept our null hypothesis since its p-value has greater value than 0.005
+
+
+# Building Objest TS with another method
+
+## Holt's Winter
+
+```{r}
+theft_hw <- HoltWinters(data_train)
+```
+
+```{r}
+theft_hw_f <- forecast(theft_hw, h = 24*7)
+```
+
+```{r}
+shapiro.test(theft_hw_f$residuals)
+```
+
+## Using log tranformation
+  Change all 0 value into 1 to prevent -Inf valu appear that can cause error when building the model using arima
+  
+```{r}
+theft_pad_log <- theft_pad %>% 
+  mutate(total_cases = if_else(total_cases == 0, 1, total_cases),
+         total_cases = log(total_cases)
+         )
+```
+
+```{r}
+summary(theft_pad_log)
+```
+
+
+```{r}
+theft_log_msts <- theft_pad_log$total_cases %>% 
+  msts(seasonal.periods = c(24*7, 24*7*4))
+```
+
+```{r}
+data_test_log <- tail(theft_log_msts, 24*7)
+data_train_log <- head(theft_log_msts, -24*7)
+```
+
+```{r}
+theft_log_arima <- stlm(data_train_log, method = "arima")
+```
+
+```{r}
+theft_log_arima_f <- forecast(theft_log_arima, h = 24*7)
+```
+
+```{r}
+shapiro.test(exp(theft_log_arima_f$residuals))
+```
+
+Even after using log transformation, our residual seems not normally distributed, So I decided to use our second models to do prediciton for next 7 days
+
+
+# Forcasting for next 7 days
+
+## Model Building and Plotting
+
+```{r}
+theft_arima_final <- stlm(theft_msts, method = "arima")
+```
+
+```{r}
+theft_final_f <- forecast(theft_arima_final, h = 24*7)
+```
+
+```{r}
+theft_final_f$mean %>% 
+  autoplot()
+```
+
+
+## Create New Data Frame
+
+```{r}
+# Membuat vektor tanggal dari 2023-01-01 hingga 2023-01-07
+df <- data.frame(Date = seq(from = ymd_hms("2023-04-11 00:00:00"), to = ymd_hms("2023-04-17 23:00:00"), by = "hour"))
+```
+
+##
+```{r}
+df_forcasting <- df %>% 
+  mutate(theft_predict = theft_final_f$mean,
+         theft_predict = ceiling(theft_predict),
+         Date = ymd_hms(Date))
+
+df_forcasting
+```
+
+## Plotting Pur Result
+
+```{r fig.width=9}
+plot1 <- ggplot(data = df_forcasting, aes(x = Date, y = theft_predict)) +
+  geom_col(aes(fill = theft_predict))+
+  theme_minimal()
+
+plot1
+```
+
+  Our plot is too crowded so its not intuitive, I'll try to do aggregation each hour to see which hour has the highest probability for theft to happen
+
+```{r}
+df_agg <- df_forcasting %>% 
+  mutate(hour = hour(Date)) %>% 
+  select(hour, theft_predict) %>% 
+  group_by(hour) %>% 
+  summarise(theft_predict = mean(theft_predict))
+```
+
+```{r fig.width=9}
+plot2 <- ggplot(data = df_agg, aes(x = hour, y = theft_predict)) +
+  geom_col(aes(fill = theft_predict))+
+  theme_minimal()
+
+plot2
+```
+
+  From the plot above, we can conclude that highest probability for theft crime to happend is around early days, midday and in afternoon.
